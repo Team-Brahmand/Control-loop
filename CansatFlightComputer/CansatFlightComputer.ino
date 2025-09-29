@@ -1,4 +1,14 @@
-// CansatFlightComputer.ino
+// ==============================================================================
+// CansatFlightComputer_Integrated.ino
+//
+// DESCRIPTION:
+// This code merges the CansatFlightComputer structure with the IntegratedSensorHub.
+// - Retains the dual-core FreeRTOS architecture for robust operation.
+// - Integrates BNO08x IMU, BMP390 Barometer, and ADS1115 ADC.
+// - Adds non-blocking servo motor control for actuator tasks.
+// - Includes an SSD1306 OLED display for real-time onboard telemetry.
+//
+// ==============================================================================
 
 // SECTION: INCLUDES
 #include <Wire.h>
@@ -7,22 +17,48 @@
 #include <SD.h>
 #include "esp_system.h"
 #include "config.h"
-#include <Adafruit_LPS2X.h>
 #include <Adafruit_Sensor.h>
 #include <TinyGPS++.h>
-
-#include "Adafruit_SHT4x.h"
-#include <Adafruit_ADS1X15.h>
 #include <bsec.h> // Bosch BSEC library for BME680
 
-// SECTION: SENSOR OBJECTS
+// Libraries from the second script
+#include <ESP32Servo.h>         // For Servo Control
+#include <Adafruit_LPS2X.h>
+#include <Adafruit_BMP3XX.h>      // BMP390
+#include <Adafruit_BNO08x.h>      // BNO08x
+#include <Adafruit_GFX.h>         // For OLED
+#include <Adafruit_SSD1306.h>     // For OLED
+#include "Adafruit_SHT4x.h"
+#include <Adafruit_ADS1X15.h>
+
+// ==============================================================================
+// HARDWARE CONFIGURATION
+// (Addresses from your second code file have been added here)
+// ==============================================================================
+#define SERVO_PIN 27            
+#define BNO08X_I2C_ADDR 0x4B
+#define BMP_I2C_ADDR    0x77
+#define ADS_ADDR        0x48
+#define OLED_ADDR       0x3C
+#define BME_ADDR        0x76    // <-- ADDED THIS
+#define LPS22_ADDR      0x5C    // <-- ADDED THIS
+
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+
+// SECTION: SENSOR & ACTUATOR OBJECTS
 Adafruit_LPS22 lps = Adafruit_LPS22();
 Adafruit_Sensor *lps_pressure = NULL;
 Adafruit_Sensor *lps_temp = NULL;
 TinyGPSPlus gps;
 Adafruit_SHT4x sht41 = Adafruit_SHT4x();
-// Adafruit_ADS1115 ads;
-Bsec bme680; // BSEC library object for BME680
+Adafruit_ADS1115 ads;
+Bsec bme680;
+Servo myServo;
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+Adafruit_BMP3XX bmp;
+Adafruit_BNO08x bno = Adafruit_BNO08x();
+sh2_SensorValue_t bnoSensorValue;
 
 // SECTION: GLOBAL OBJECTS & VARIABLES
 enum FlightState {
@@ -42,9 +78,10 @@ volatile struct TelemetryData {
     FlightState flightState = BOOT;
     float gnssLatitude = 0.0, gnssLongitude = 0.0, gnssAltitude = 0.0;
     int gnssSatellites = 0;
-    float imu_accelX = 0.0, imu_accelY = 0.0, imu_accelZ = 0.0;
-    float gyroSpinRate = 0.0;
     
+    // IMU Data from BNO08x
+    float bno_qi=NAN, bno_qj=NAN, bno_qk=NAN, bno_qr=NAN;
+
     // SHT41 Data
     float sht41_temperature = 0.0;
     float sht41_humidity = 0.0;
@@ -53,17 +90,25 @@ volatile struct TelemetryData {
     float bme680_pressure = 0.0;
     float bme680_temperature = 0.0;
     float bme680_humidity = 0.0;
-    float bme680_gas_resistance = 0.0; // In Ohms
-    float bme680_iaq = 0.0; // Index for Air Quality
+    float bme680_gas_resistance = 0.0;
+    float bme680_iaq = 0.0;
+
+    // BMP390 Data (Redundancy)
+    float bmp_temp=NAN, bmp_pressure=NAN;
 
     // ADS1115 Data (Payload Sensor)
     float payload_sensor_voltage = 0.0;
 
 } telemetryData;
 
-volatile FlightState currentFlightState = BOOT;
 TaskHandle_t Task_Core0, Task_Core1;
 File dataFile, eventFile;
+
+// NEW: Boolean flags to track sensor status
+bool oled_ok=false, lps_ok=false, bmp_ok=false, bno_ok=false;
+bool sht_ok=false, ads_ok=false, bme_ok=false, servo_ok=false;
+
+volatile FlightState currentFlightState = BOOT;
 
 // SECTION: FUNCTION PROTOTYPES
 void logEvent(String eventMessage);
@@ -78,6 +123,7 @@ void readIMU();
 void readVoltage();
 void readSHT41();
 void readBME680();
+void readBMP390();
 void readADS1115();
 void checkIaqSensorStatus(void);
 void updateFlightState();
@@ -85,6 +131,7 @@ void manageActuators();
 void sendTelemetry();
 void receiveCommands();
 void processCommand(String command);
+void displayTelemetry();
 
 // ==============================================================================
 // SETUP: Runs once on boot.
@@ -93,15 +140,8 @@ void setup() {
     DEBUG_SERIAL.begin(115200);
     delay(1000);
 
-    // LED Startup Sequence
     pinMode(STATUS_LED_PIN, OUTPUT);
-    unsigned long startTime = millis();
-    while (millis() - startTime < 3000) {
-        digitalWrite(STATUS_LED_PIN, HIGH);
-        delay(100);
-        digitalWrite(STATUS_LED_PIN, LOW);
-        delay(100);
-    }
+    digitalWrite(STATUS_LED_PIN, HIGH); // Turn on LED during setup
 
     DEBUG_SERIAL.println("======================================");
     DEBUG_SERIAL.printf("CANSAT %s BOOTING...\n", TEAM_ID);
@@ -109,9 +149,9 @@ void setup() {
     isInTestMode = false;
 
     Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
-    Wire.setClock(100000); // Set I2C clock to 100kHz (standard speed)
+    Wire.setClock(400000); // Use 400kHz I2C speed for faster sensor reads
     XBEE_SERIAL.begin(9600);
-    GPS_SERIAL.begin(9600, SERIAL_8N1, 13, 12); // RX on 13, TX on 12
+    GPS_SERIAL.begin(9600, SERIAL_8N1, 13, 12);
 
     if (!SD.begin(SD_CS_PIN, SPI)) {
         sdCardOK = false;
@@ -120,7 +160,8 @@ void setup() {
         sdCardOK = true;
         dataFile = SD.open("/data_log.csv", FILE_APPEND);
         if (dataFile && dataFile.size() < 20) {
-            dataFile.println("TeamID,Timestamp,Packet,State,Altitude,Pressure,Temp,Voltage,Lat,Lon,Sats,AccelZ,GyroSpin,SHT_Temp,SHT_Hum,BME_Press,BME_Temp,BME_Hum,BME_Gas,BME_IAQ,ADS_V");
+            // Updated header with new sensor data
+            dataFile.println("TeamID,Timestamp,Packet,State,Altitude,Pressure,Temp,Voltage,Lat,Lon,Sats,BNO_qi,BNO_qj,BNO_qk,BNO_qr,SHT_Temp,SHT_Hum,BME_Press,BME_Temp,BME_Hum,BME_Gas,BME_IAQ,BMP_Press,BMP_Temp,ADS_V");
         }
         if (dataFile) dataFile.close();
 
@@ -142,6 +183,8 @@ void setup() {
     
     xTaskCreatePinnedToCore(core0_Task, "Core0_Pilot", 10000, NULL, 2, &Task_Core0, 0);
     xTaskCreatePinnedToCore(core1_Task, "Core1_Comms", 10000, NULL, 1, &Task_Core1, 1);
+
+    digitalWrite(STATUS_LED_PIN, LOW); // Turn off LED after setup
 }
 
 void loop() {
@@ -149,7 +192,7 @@ void loop() {
 }
 
 // ==============================================================================
-// CORE 0 TASK: Handles sensors, flight logic, and data logging.
+// CORE 0 TASK: Handles sensors, flight logic, display, actuators, and logging.
 // ==============================================================================
 void core0_Task(void *pvParameters) {
     TickType_t xLastWakeTime = xTaskGetTickCount();
@@ -157,7 +200,6 @@ void core0_Task(void *pvParameters) {
     static bool ledState = false;
     
     for (;;) {
-        // "Breathing" LED indicator for normal operation
         ledState = !ledState;
         digitalWrite(STATUS_LED_PIN, ledState);
 
@@ -165,7 +207,8 @@ void core0_Task(void *pvParameters) {
         updateFlightState();
         manageActuators();
         logDataToSD();
-        vTaskDelay(pdMS_TO_TICKS(1)); // Stability delay
+        displayTelemetry(); // Update the OLED display
+        
         vTaskDelayUntil(&xLastWakeTime, xFrequency);
     }
 }
@@ -201,20 +244,20 @@ void logEvent(String eventMessage) {
 }
 
 void logDataToSD() {
-    if (!sdCardOK) {
-        return;
-    }
+    if (!sdCardOK) return;
+    
     dataFile = SD.open("/data_log.csv", FILE_APPEND);
     if (dataFile) {
-        char dataString[350]; // Increased buffer size for new data
-        snprintf(dataString, sizeof(dataString), "%s,%.2f,%lu,%d,%.2f,%.0f,%.2f,%.2f,%.4f,%.4f,%d,%.2f,%.2f,%.2f,%.2f,%.0f,%.2f,%.2f,%.0f,%.1f,%.3f",
+        char dataString[500]; // Increased buffer for new data
+        snprintf(dataString, sizeof(dataString), "%s,%.2f,%lu,%d,%.2f,%.0f,%.2f,%.2f,%.4f,%.4f,%d,%.4f,%.4f,%.4f,%.4f,%.2f,%.2f,%.0f,%.2f,%.2f,%.0f,%.1f,%.0f,%.2f,%.3f",
             TEAM_ID, telemetryData.timeStamp, telemetryData.packetCount, telemetryData.flightState,
             telemetryData.altitude, telemetryData.pressure, telemetryData.temperature, telemetryData.voltage,
             telemetryData.gnssLatitude, telemetryData.gnssLongitude, telemetryData.gnssSatellites,
-            telemetryData.imu_accelZ, telemetryData.gyroSpinRate,
+            telemetryData.bno_qi, telemetryData.bno_qj, telemetryData.bno_qk, telemetryData.bno_qr, // New IMU data
             telemetryData.sht41_temperature, telemetryData.sht41_humidity,
             telemetryData.bme680_pressure, telemetryData.bme680_temperature, telemetryData.bme680_humidity,
             telemetryData.bme680_gas_resistance, telemetryData.bme680_iaq,
+            telemetryData.bmp_pressure, telemetryData.bmp_temp, // New BMP390 data
             telemetryData.payload_sensor_voltage);
         dataFile.println(dataString);
         dataFile.close();
@@ -224,83 +267,127 @@ void logDataToSD() {
 // ==============================================================================
 // SENSOR SETUP AND READING FUNCTIONS
 // ==============================================================================
+// ==============================================================================
+// SENSOR SETUP AND READING FUNCTIONS (ROBUST VERSION)
+// ==============================================================================
 void setupSensors() {
-    logEvent("Initializing sensors...");
-    // LPS22
-    if (!lps.begin_I2C()) {
-        logEvent("CRITICAL ERROR: Failed to find LPS22 sensor!");
-        while (1) {
-            digitalWrite(STATUS_LED_PIN, HIGH);
-            delay(1000);
-        }
+    logEvent("Initializing sensors (robust check)...");
+
+    // OLED Display
+    DEBUG_SERIAL.print("Initializing OLED... ");
+    if (display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
+        display.clearDisplay();
+        display.setTextSize(1);
+        display.setTextColor(SSD1306_WHITE);
+        display.setCursor(0,0);
+        display.println("Sensors Init...");
+        display.display();
+        oled_ok = true;
+        DEBUG_SERIAL.println("OK");
     } else {
-        logEvent("LPS22 Sensor Initialized.");
+        DEBUG_SERIAL.println("FAILED!");
+    }
+
+    // Servo
+    DEBUG_SERIAL.print("Initializing Servo... ");
+    ESP32PWM::allocateTimer(0);
+    if (myServo.attach(SERVO_PIN)) {
+        servo_ok = true;
+        DEBUG_SERIAL.println("OK");
+    } else {
+        DEBUG_SERIAL.println("FAILED!");
+    }
+
+    // LPS22 (Primary Barometer)
+    DEBUG_SERIAL.print("Initializing LPS22 (0x5C)... ");
+    if (lps.begin_I2C(LPS22_ADDR)) {
         lps_pressure = lps.getPressureSensor();
         lps_temp = lps.getTemperatureSensor();
-    }
-
-    // SHT41
-    if (!sht41.begin()) {
-        logEvent("ERROR: Failed to find SHT41 sensor!");
+        lps_ok = true;
+        DEBUG_SERIAL.println("OK");
     } else {
-        logEvent("SHT41 Sensor Initialized.");
-        sht41.setPrecision(SHT4X_HIGH_PRECISION);
-        sht41.setHeater(SHT4X_NO_HEATER);
+        DEBUG_SERIAL.println("FAILED!");
+    }
+    
+    // BMP390 (Secondary Barometer)
+    DEBUG_SERIAL.print("Initializing BMP390 (0x77)... ");
+    if (bmp.begin_I2C(BMP_I2C_ADDR)) {
+        bmp.setTemperatureOversampling(BMP3_OVERSAMPLING_8X);
+        bmp.setPressureOversampling(BMP3_OVERSAMPLING_4X);
+        bmp_ok = true;
+        DEBUG_SERIAL.println("OK");
+    } else {
+        DEBUG_SERIAL.println("FAILED!");
+    }
+    
+    // BNO08x (IMU)
+    DEBUG_SERIAL.print("Initializing BNO08x (0x4B)... ");
+    if (bno.begin_I2C(BNO08X_I2C_ADDR)) {
+        if (bno.enableReport(SH2_ROTATION_VECTOR)) {
+            bno_ok = true;
+            DEBUG_SERIAL.println("OK");
+        } else {
+            DEBUG_SERIAL.println("FAILED to enable report!");
+        }
+    } else {
+        DEBUG_SERIAL.println("FAILED!");
     }
 
-    // // ADS1115
-    // if (!ads.begin()) {
-    //     logEvent("ERROR: Failed to find ADS1115!");
-    // } else {
-    //     logEvent("ADS1115 ADC Initialized.");
-    // }
+    // SHT41 (Humidity)
+    DEBUG_SERIAL.print("Initializing SHT41... ");
+    if (sht41.begin()) {
+        sht_ok = true;
+        DEBUG_SERIAL.println("OK");
+    } else {
+        DEBUG_SERIAL.println("FAILED!");
+    }
+
+    // ADS1115 (ADC)
+    DEBUG_SERIAL.print("Initializing ADS1115 (0x48)... ");
+    if (ads.begin(ADS_ADDR)) {
+        ads.setGain(GAIN_ONE);
+        ads_ok = true;
+        DEBUG_SERIAL.println("OK");
+    } else {
+        DEBUG_SERIAL.println("FAILED!");
+    }
     
-    // BME680 with BSEC
-    // CHANGED: Use BME68X_I2C_ADDR_LOW for the primary address 0x76
-    bme680.begin(BME68X_I2C_ADDR_LOW, Wire); 
-    logEvent("BME680 BSEC version " + String(bme680.version.major) + "." + String(bme680.version.minor) + "." + String(bme680.version.major_bugfix) + "." + String(bme680.version.minor_bugfix));
-    checkIaqSensorStatus();
-    
-    bsec_virtual_sensor_t sensorList[10] = {
-        BSEC_OUTPUT_RAW_TEMPERATURE, BSEC_OUTPUT_RAW_PRESSURE, BSEC_OUTPUT_RAW_HUMIDITY,
-        BSEC_OUTPUT_RAW_GAS, BSEC_OUTPUT_IAQ, BSEC_OUTPUT_STATIC_IAQ, BSEC_OUTPUT_CO2_EQUIVALENT,
-        BSEC_OUTPUT_BREATH_VOC_EQUIVALENT, BSEC_OUTPUT_STABILIZATION_STATUS, BSEC_OUTPUT_RUN_IN_STATUS
-    };
-    bme680.updateSubscription(sensorList, 10, BSEC_SAMPLE_RATE_LP);
-    checkIaqSensorStatus();
+    // BME680 (Air Quality)
+    DEBUG_SERIAL.print("Initializing BME680 (0x76)... ");
+    bme680.begin(BME_ADDR, Wire); 
+    if (bme680.bsecStatus == BSEC_OK && bme680.bme68xStatus == BME68X_OK) {
+        bsec_virtual_sensor_t sensorList[10] = { BSEC_OUTPUT_RAW_TEMPERATURE, BSEC_OUTPUT_RAW_PRESSURE, BSEC_OUTPUT_RAW_HUMIDITY, BSEC_OUTPUT_RAW_GAS, BSEC_OUTPUT_IAQ, BSEC_OUTPUT_STATIC_IAQ, BSEC_OUTPUT_CO2_EQUIVALENT, BSEC_OUTPUT_BREATH_VOC_EQUIVALENT, BSEC_OUTPUT_STABILIZATION_STATUS, BSEC_OUTPUT_RUN_IN_STATUS };
+        bme680.updateSubscription(sensorList, 10, BSEC_SAMPLE_RATE_LP);
+        bme_ok = true;
+        DEBUG_SERIAL.println("OK");
+    } else {
+        DEBUG_SERIAL.println("FAILED!");
+    }
+    logEvent("Sensor init check complete.");
 }
 
 void readAllSensors() {
     telemetryData.timeStamp = millis() / 1000.0f;
-    readBarometer();
+    
+    if (lps_ok) readBarometer();
+    if (bno_ok) readIMU();
+    if (sht_ok) readSHT41();
+    if (bme_ok) readBME680();
+    if (bmp_ok) readBMP390();
+    if (ads_ok) readADS1115();
+    
+    // These functions don't depend on I2C sensors
     readGPS();
-    readIMU();
     readVoltage();
-    readSHT41();
-    readBME680();
-    // readADS1115();
-
-    #if DEBUG_PRINT_ENABLED
-        if (!isInTestMode) {
-            DEBUG_SERIAL.println("--------------------------------------");
-        }
-    #endif
 }
 
 void readBarometer() { // LPS22
-    if (isInTestMode) {
-        telemetryData.pressure = 101300.0 + (rand() % 100 - 50);
-        telemetryData.temperature = 25.0 + (float)(rand() % 100) / 100.0;
-    } else {
-        sensors_event_t pressure_event, temp_event;
-        lps_pressure->getEvent(&pressure_event);
-        lps_temp->getEvent(&temp_event);
-        telemetryData.pressure = pressure_event.pressure * 100; // hPa to Pa
-        telemetryData.temperature = temp_event.temperature;
-        #if DEBUG_PRINT_ENABLED
-            DEBUG_SERIAL.printf("LPS22 -> Pressure: %.2f Pa, Temp: %.2f C\n", telemetryData.pressure, telemetryData.temperature);
-        #endif
-    }
+    sensors_event_t pressure_event, temp_event;
+    lps_pressure->getEvent(&pressure_event);
+    lps_temp->getEvent(&temp_event);
+    telemetryData.pressure = pressure_event.pressure * 100; // hPa to Pa
+    telemetryData.temperature = temp_event.temperature;
+    
     // Calculate altitude based on the primary pressure sensor
     if (telemetryData.pressure > 0) {
         telemetryData.altitude = 44330 * (1.0f - pow(telemetryData.pressure / (SEALEVELPRESSURE_HPA * 100), 0.1903));
@@ -308,113 +395,73 @@ void readBarometer() { // LPS22
 }
 
 void readGPS() {
-    if (isInTestMode) {
-        telemetryData.gnssLatitude = 17.3850 + (float)(rand() % 100) / 10000.0;
-        telemetryData.gnssLongitude = 78.4867 + (float)(rand() % 100) / 10000.0;
-        telemetryData.gnssAltitude = 545.0 + (float)(rand() % 20);
-        telemetryData.gnssSatellites = (rand() % 4) + 7;
-    } else {
-        while (GPS_SERIAL.available() > 0) {
-            gps.encode(GPS_SERIAL.read());
-        }
-        if (gps.location.isUpdated() && gps.location.isValid()) {
-            telemetryData.gnssLatitude = gps.location.lat();
-            telemetryData.gnssLongitude = gps.location.lng();
-            telemetryData.gnssAltitude = gps.altitude.meters();
-            telemetryData.gnssSatellites = gps.satellites.value();
-            #if DEBUG_PRINT_ENABLED
-                DEBUG_SERIAL.printf("GPS -> Lat: %.4f, Lon: %.4f, Sats: %d\n", telemetryData.gnssLatitude, telemetryData.gnssLongitude, telemetryData.gnssSatellites);
-            #endif
-        }
+    while (GPS_SERIAL.available() > 0) {
+        gps.encode(GPS_SERIAL.read());
+    }
+    if (gps.location.isUpdated() && gps.location.isValid()) {
+        telemetryData.gnssLatitude = gps.location.lat();
+        telemetryData.gnssLongitude = gps.location.lng();
+        telemetryData.gnssAltitude = gps.altitude.meters();
+        telemetryData.gnssSatellites = gps.satellites.value();
     }
 }
 
-void readIMU() {
-    // NOTE: This is a stub function. You need to add your IMU library (e.g., ICM-20948, MPU-6050)
-    // and reading logic here.
-    if (isInTestMode) {
-        telemetryData.imu_accelZ = 1.0 + (float)(rand() % 50) / 100.0;
-        telemetryData.gyroSpinRate = 5.0 + (float)(rand() % 200) / 100.0;
+void readIMU() { // Reads BNO08x
+    if (bno.getSensorEvent(&bnoSensorValue)) {
+      if (bnoSensorValue.sensorId == SH2_ROTATION_VECTOR) {
+        telemetryData.bno_qi = bnoSensorValue.un.rotationVector.i;
+        telemetryData.bno_qj = bnoSensorValue.un.rotationVector.j;
+        telemetryData.bno_qk = bnoSensorValue.un.rotationVector.k;
+        telemetryData.bno_qr = bnoSensorValue.un.rotationVector.real;
+      }
     }
 }
 
 void readVoltage() {
-    if (isInTestMode) {
-        telemetryData.voltage = 4.1 - (float)(rand() % 20) / 100.0;
-    } else {
-        int rawADC = analogRead(VOLTAGE_PIN);
-        telemetryData.voltage = (rawADC / 4095.0) * 3.3 * VOLTAGE_DIVIDER_RATIO;
-        #if DEBUG_PRINT_ENABLED
-            DEBUG_SERIAL.printf("Voltage -> Batt: %.2f V\n", telemetryData.voltage);
-        #endif
-    }
+    int rawADC = analogRead(VOLTAGE_PIN);
+    telemetryData.voltage = (rawADC / 4095.0) * 3.3 * VOLTAGE_DIVIDER_RATIO;
 }
 
 void readSHT41() {
-    if (isInTestMode) {
-        telemetryData.sht41_temperature = 24.5 + (float)(rand() % 100) / 100.0;
-        telemetryData.sht41_humidity = 55.0 + (float)(rand() % 100) / 100.0;
-    } else {
-        sensors_event_t humidity, temp;
-        sht41.getEvent(&humidity, &temp);
-        telemetryData.sht41_temperature = temp.temperature;
-        telemetryData.sht41_humidity = humidity.relative_humidity;
-        #if DEBUG_PRINT_ENABLED
-            DEBUG_SERIAL.printf("SHT41 -> Temp: %.2f C, Humidity: %.2f %%\n", telemetryData.sht41_temperature, telemetryData.sht41_humidity);
-        #endif
-    }
+    sensors_event_t humidity, temp;
+    sht41.getEvent(&humidity, &temp);
+    telemetryData.sht41_temperature = temp.temperature;
+    telemetryData.sht41_humidity = humidity.relative_humidity;
 }
 
 void readBME680() {
-    if (isInTestMode) {
-        telemetryData.bme680_pressure = 101350.0 + (rand() % 100 - 50);
-        telemetryData.bme680_temperature = 26.0 + (float)(rand() % 100) / 100.0;
-        telemetryData.bme680_humidity = 54.0 + (float)(rand() % 100) / 100.0;
-        telemetryData.bme680_gas_resistance = 50000.0 + (rand() % 1000);
-        telemetryData.bme680_iaq = 25.0 + (rand() % 10);
+    if (bme680.run()) { // This reads the sensor
+        telemetryData.bme680_pressure = bme680.pressure;
+        telemetryData.bme680_temperature = bme680.temperature;
+        telemetryData.bme680_humidity = bme680.humidity;
+        telemetryData.bme680_gas_resistance = bme680.gasResistance;
+        telemetryData.bme680_iaq = bme680.iaq;
     } else {
-        if (bme680.run()) { // This reads the sensor
-            telemetryData.bme680_pressure = bme680.pressure;
-            telemetryData.bme680_temperature = bme680.temperature;
-            telemetryData.bme680_humidity = bme680.humidity;
-            telemetryData.bme680_gas_resistance = bme680.gasResistance;
-            telemetryData.bme680_iaq = bme680.iaq;
-            #if DEBUG_PRINT_ENABLED
-                DEBUG_SERIAL.printf("BME680 -> Press: %.0f Pa, Temp: %.2f C, Hum: %.2f %%, Gas: %.0f Ohm, IAQ: %.1f\n", 
-                    telemetryData.bme680_pressure, telemetryData.bme680_temperature, telemetryData.bme680_humidity,
-                    telemetryData.bme680_gas_resistance, telemetryData.bme680_iaq);
-            #endif
-        } else {
-            checkIaqSensorStatus();
-        }
+        checkIaqSensorStatus();
     }
 }
 
-// void readADS1115() {
-//     if (isInTestMode) {
-//         telemetryData.payload_sensor_voltage = 3.3 * (float)(rand() % 100) / 100.0;
-//     } else {
-//         int16_t adc0 = ads.readADC_SingleEnded(0);
-//         // This factor (0.1875mV) is for the default gain setting (+/-6.144V range).
-//         // Change if you set a different gain (e.g., ads.setGain(GAIN_ONE)).
-//         telemetryData.payload_sensor_voltage = adc0 * 0.0001875F;
-//         #if DEBUG_PRINT_ENABLED
-//             DEBUG_SERIAL.printf("ADS1115 -> A0 Raw: %d, Voltage: %.3f V\n", adc0, telemetryData.payload_sensor_voltage);
-//         #endif
-//     }
-// }
+void readBMP390() { // Reads secondary barometer
+    if (bmp.performReading()) {
+        telemetryData.bmp_temp = bmp.temperature;
+        telemetryData.bmp_pressure = bmp.pressure;
+    }
+}
+
+void readADS1115() {
+    int16_t adc0 = ads.readADC_SingleEnded(0);
+    // LSB value for GAIN_ONE (+/-4.096V) is 0.125mV
+    telemetryData.payload_sensor_voltage = adc0 * 0.000125F;
+}
 
 void checkIaqSensorStatus(void) {
     String output = "";
-    // CHANGED: bme680.status is now bme680.bsecStatus
     if (bme680.bsecStatus != BSEC_OK) {
         if (bme680.bsecStatus < BSEC_OK) output = "BSEC error";
         else output = "BSEC warning";
         logEvent(output + ": " + String(bme680.bsecStatus));
     }
     
-    // CHANGED: bme680.bme680Status is now bme680.bme68xStatus
-    // CHANGED: BME680_OK is now BME68X_OK
     if (bme680.bme68xStatus != BME68X_OK) {
         if (bme680.bme68xStatus < BME68X_OK) output = "BME680 error";
         else output = "BME680 warning";
@@ -423,54 +470,102 @@ void checkIaqSensorStatus(void) {
 }
 
 // ==============================================================================
-// FLIGHT LOGIC & ACTUATORS (STUBS)
+// OLED DISPLAY FUNCTION
+// ==============================================================================
+void displayTelemetry() {
+    display.clearDisplay();
+    display.setCursor(0,0);
+    display.setTextSize(1);
+    
+    display.printf("State: %d Alt: %.1fm\n", telemetryData.flightState, telemetryData.altitude);
+    display.printf("P: %.0fhPa T: %.1fC\n", telemetryData.pressure / 100.0f, telemetryData.temperature);
+    display.printf("Lat: %.3f\nLon: %.3f Sats:%d\n", telemetryData.gnssLatitude, telemetryData.gnssLongitude, telemetryData.gnssSatellites);
+    display.printf("V: %.2fV IAQ: %.0f\n", telemetryData.voltage, telemetryData.bme680_iaq);
+    display.printf("qi:%.2f qj:%.2f\n", telemetryData.bno_qi, telemetryData.bno_qj);
+    display.printf("qk:%.2f qr:%.2f\n", telemetryData.bno_qk, telemetryData.bno_qr);
+
+    display.display();
+}
+
+// ==============================================================================
+// FLIGHT LOGIC & ACTUATORS
 // ==============================================================================
 void updateFlightState() {
-    // NOTE: This is a stub function. You need to implement your flight state machine logic here,
-    // using the thresholds defined in config.h.
+    // NOTE: This is a stub function. Implement your flight state machine logic here.
     if (isInTestMode) {
         currentFlightState = LAUNCH_PAD;
     }
 }
 
 void manageActuators() {
-    // NOTE: This is a stub function. You need to implement actuator control based on the currentFlightState.
-    // (e.g., deploy parachute in DESCENT state, activate buzzer in RECOVERY state)
-    if (isInTestMode) {
-        digitalWrite(BUZZER_PIN, LOW);
+    // This function now contains the NON-BLOCKING servo sweep logic.
+    // It can be expanded to control other things like buzzers or pyro channels.
+    
+    static int servoPos = 0;
+    static int servoState = 0; // 0=sweeping up, 1=pausing at top, 2=sweeping down, 3=pausing at bottom
+    static unsigned long lastServoMoveTime = 0;
+
+    const int SWEEP_DELAY_MS = 15;
+    const int PAUSE_DELAY_MS = 2000;
+
+    if (millis() - lastServoMoveTime > SWEEP_DELAY_MS && (servoState == 0 || servoState == 2)) {
+        lastServoMoveTime = millis();
+        if (servoState == 0) { // Sweeping up
+            servoPos++;
+            myServo.write(servoPos);
+            if (servoPos >= 180) {
+                servoState = 1; // Switch to pausing at top
+            }
+        } else { // Sweeping down
+            servoPos--;
+            myServo.write(servoPos);
+            if (servoPos <= 0) {
+                servoState = 3; // Switch to pausing at bottom
+            }
+        }
+    }
+
+    if (millis() - lastServoMoveTime > PAUSE_DELAY_MS && (servoState == 1 || servoState == 3)) {
+        lastServoMoveTime = millis();
+        if (servoState == 1) { // Was pausing at top
+            servoState = 2; // Switch to sweeping down
+        } else { // Was pausing at bottom
+            servoState = 0; // Switch to sweeping up
+        }
+    }
+
+    // Example of other actuator logic
+    if (currentFlightState == RECOVERY) {
+        // activate buzzer
     }
 }
+
 
 // ==============================================================================
 // COMMUNICATION FUNCTIONS
 // ==============================================================================
-
 void sendTelemetry() {
-    telemetryData.packetCount = telemetryData.packetCount + 1;
-    char telemetryString[300]; // Increased buffer size
+    telemetryData.packetCount++;
+    char telemetryString[300]; 
     
-    // WARNING: This packet is very long. Ensure your ground station and radio can handle this length.
-    // This example sends a subset of data for brevity. Customize as needed.
-    // CORRECTED: Changed format specifiers (%d -> %.2f) for float values like altitude.
+    // Updated packet to include BNO08x quaternion data instead of old stubs
     snprintf(telemetryString, sizeof(telemetryString),
-             "%s,%.2f,%lu,%d,%.2f,%.0f,%.2f,%.2f,%.4f,%.4f,%.1f,%d,%.2f,%.2f,%.2f,%.1f,%d\r\n",
+             "%s,%.2f,%lu,%d,%.2f,%.0f,%.2f,%.2f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%d\r\n",
              TEAM_ID, 
              telemetryData.timeStamp, 
              telemetryData.packetCount,
-             telemetryData.flightState, // Note: State is now 4th, Altitude is 5th
+             telemetryData.flightState,
              telemetryData.altitude,
-             telemetryData.bme680_pressure, 
-             telemetryData.bme680_temperature, 
+             telemetryData.pressure, 
+             telemetryData.temperature, 
              telemetryData.voltage,
              telemetryData.gnssLatitude, 
              telemetryData.gnssLongitude, 
-             telemetryData.gnssAltitude, 
-             telemetryData.gnssSatellites,
-             telemetryData.imu_accelZ,
-             telemetryData.gyroSpinRate,
-             telemetryData.sht41_humidity,
-             telemetryData.bme680_iaq,
-             (int)telemetryData.flightState); // The old state variable at the end
+             telemetryData.bno_qi, // IMU Data
+             telemetryData.bno_qj, // IMU Data
+             telemetryData.bno_qk, // IMU Data
+             telemetryData.bno_qr, // IMU Data
+             telemetryData.gnssSatellites);
 
     XBEE_SERIAL.print(telemetryString);
     if(DEBUG_PRINT_ENABLED){
@@ -481,7 +576,6 @@ void sendTelemetry() {
 void processCommand(String command) {
     command.trim();
     if (command.length() == 0) return;
-
     logEvent("Command received: " + command);
 
     if (command.equalsIgnoreCase("CMD,SET_MODE,TEST")) {
@@ -496,7 +590,6 @@ void processCommand(String command) {
         }
     } else if (command.equalsIgnoreCase("CALIBRATE")) {
         logEvent("Executing calibration command.");
-        // Add sensor calibration logic here
     } else {
         logEvent("Unknown command: " + command);
     }

@@ -34,6 +34,8 @@ const char* TEAM_ID = "2024ASI-CANSAT-123";
 // Analog Input Pins
 #define VOLTAGE_PIN    34
 
+#define SD_CS_PIN 5
+
 // --- Serial Port Configuration ---
 #define DEBUG_SERIAL Serial
 #define XBEE_SERIAL  Serial2
