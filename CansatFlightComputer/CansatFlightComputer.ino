@@ -497,49 +497,126 @@ void updateFlightState() {
     }
 }
 
-void manageActuators() {
-    // This function now contains the NON-BLOCKING servo sweep logic.
-    // It can be expanded to control other things like buzzers or pyro channels.
+// void manageActuators() {
+//     // This function now contains the NON-BLOCKING servo sweep logic.
+//     // It can be expanded to control other things like buzzers or pyro channels.
     
+//     static int servoPos = 0;
+//     static int servoState = 0; // 0=sweeping up, 1=pausing at top, 2=sweeping down, 3=pausing at bottom
+//     static unsigned long lastServoMoveTime = 0;
+
+//     const int SWEEP_DELAY_MS = 15;
+//     const int PAUSE_DELAY_MS = 2000;
+
+//     if (millis() - lastServoMoveTime > SWEEP_DELAY_MS && (servoState == 0 || servoState == 2)) {
+//         lastServoMoveTime = millis();
+//         if (servoState == 0) { // Sweeping up
+//             servoPos++;
+//             myServo.write(servoPos);
+//             if (servoPos >= 180) {
+//                 servoState = 1; // Switch to pausing at top
+//             }
+//         } else { // Sweeping down
+//             servoPos--;
+//             myServo.write(servoPos);
+//             if (servoPos <= 0) {
+//                 servoState = 3; // Switch to pausing at bottom
+//             }
+//         }
+//     }
+
+//     if (millis() - lastServoMoveTime > PAUSE_DELAY_MS && (servoState == 1 || servoState == 3)) {
+//         lastServoMoveTime = millis();
+//         if (servoState == 1) { // Was pausing at top
+//             servoState = 2; // Switch to sweeping down
+//         } else { // Was pausing at bottom
+//             servoState = 0; // Switch to sweeping up
+//         }
+//     }
+
+//     // Example of other actuator logic
+//     if (currentFlightState == RECOVERY) {
+//         // activate buzzer
+//     }
+// }
+
+void manageActuators() {
+    // Actuator logic is now driven by the current flight state.
+    // Static variables are used for the sweep logic so they retain their values.
     static int servoPos = 0;
     static int servoState = 0; // 0=sweeping up, 1=pausing at top, 2=sweeping down, 3=pausing at bottom
     static unsigned long lastServoMoveTime = 0;
 
-    const int SWEEP_DELAY_MS = 15;
-    const int PAUSE_DELAY_MS = 2000;
-
-    if (millis() - lastServoMoveTime > SWEEP_DELAY_MS && (servoState == 0 || servoState == 2)) {
-        lastServoMoveTime = millis();
-        if (servoState == 0) { // Sweeping up
-            servoPos++;
-            myServo.write(servoPos);
-            if (servoPos >= 180) {
-                servoState = 1; // Switch to pausing at top
+    switch (currentFlightState) {
+        case BOOT:
+        case LAUNCH_PAD:
+            // On the launch pad, hold the servo in its initial, safe position.
+            // This check prevents sending the command repeatedly.
+            if (myServo.read() != 0) {
+                myServo.write(0);
             }
-        } else { // Sweeping down
-            servoPos--;
-            myServo.write(servoPos);
-            if (servoPos <= 0) {
-                servoState = 3; // Switch to pausing at bottom
+            break;
+
+        case ASCENT: {
+            // During ascent, run the continuous sweep logic for testing or control surfaces.
+            const int SWEEP_DELAY_MS = 15;
+            const int PAUSE_DELAY_MS = 2000;
+
+            if (millis() - lastServoMoveTime > SWEEP_DELAY_MS && (servoState == 0 || servoState == 2)) {
+                lastServoMoveTime = millis();
+                if (servoState == 0) { // Sweeping up
+                    servoPos++;
+                    if (servoPos >= 180) {
+                        servoPos = 180;
+                        servoState = 1; // Switch to pausing at top
+                    }
+                } else { // Sweeping down
+                    servoPos--;
+                    if (servoPos <= 0) {
+                        servoPos = 0;
+                        servoState = 3; // Switch to pausing at bottom
+                    }
+                }
+                myServo.write(servoPos);
             }
-        }
-    }
 
-    if (millis() - lastServoMoveTime > PAUSE_DELAY_MS && (servoState == 1 || servoState == 3)) {
-        lastServoMoveTime = millis();
-        if (servoState == 1) { // Was pausing at top
-            servoState = 2; // Switch to sweeping down
-        } else { // Was pausing at bottom
-            servoState = 0; // Switch to sweeping up
+            if (millis() - lastServoMoveTime > PAUSE_DELAY_MS && (servoState == 1 || servoState == 3)) {
+                lastServoMoveTime = millis();
+                if (servoState == 1) { // Was pausing at top
+                    servoState = 2; // Switch to sweeping down
+                } else { // Was pausing at bottom
+                    servoState = 0; // Switch to sweeping up
+                }
+            }
+            break;
         }
-    }
 
-    // Example of other actuator logic
-    if (currentFlightState == RECOVERY) {
-        // activate buzzer
+        case DESCENT: // <-- SECONDARY PARACHUTE DEPLOYMENT STATE
+            // Move servo to 90 degrees to deploy the parachute.
+            // This check ensures the command is only sent if the servo isn't already there.
+            if (myServo.read() != 90) {
+                myServo.write(90);
+                logEvent("ACTUATOR: Secondary chute servo deployed to 90 deg.");
+            }
+            break;
+
+        case RECOVERY:
+            // During recovery, hold the servo in its deployed position.
+            if (myServo.read() != 90) {
+                myServo.write(90);
+            }
+            // You can also add buzzer logic here.
+            // For example: if (millis() % 2000 > 1000) { digitalWrite(BUZZER_PIN, HIGH); } else { digitalWrite(BUZZER_PIN, LOW); }
+            break;
+            
+        default:
+             // Default to a safe state if the flight state is unknown.
+            if (myServo.read() != 0) {
+                myServo.write(0);
+            }
+            break;
     }
 }
-
 
 // ==============================================================================
 // COMMUNICATION FUNCTIONS
