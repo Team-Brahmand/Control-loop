@@ -1,16 +1,8 @@
 // ==============================================================================
-// CansatFlightComputer_Integrated.ino
-//
-// DESCRIPTION:
-// This code merges the CansatFlightComputer structure with the IntegratedSensorHub.
-// - Retains the dual-core FreeRTOS architecture for robust operation.
-// - Integrates BNO08x IMU, BMP390 Barometer, and ADS1115 ADC.
-// - Adds non-blocking servo motor control for actuator tasks.
-// - Includes an SSD1306 OLED display for real-time onboard telemetry.
-//
+// CansatFlightComputer_Enhanced.ino
+// Enhanced version with complete state machine and improved reliability
 // ==============================================================================
 
-// SECTION: INCLUDES
 #include <Wire.h>
 #include <SPI.h>
 #include <FS.h>
@@ -18,99 +10,127 @@
 #include "esp_system.h"
 #include "config.h"
 #include <Adafruit_Sensor.h>
-#include <TinyGPS++.h>
-#include <bsec.h> // Bosch BSEC library for BME680
-
-// Libraries from the second script
-#include <ESP32Servo.h>         // For Servo Control
+#include <bsec.h>
+#include <ESP32Servo.h>
 #include <Adafruit_LPS2X.h>
-#include <Adafruit_BMP3XX.h>      // BMP390
-#include <Adafruit_BNO08x.h>      // BNO08x
-#include <Adafruit_GFX.h>         // For OLED
-#include <Adafruit_SSD1306.h>     // For OLED
 #include "Adafruit_SHT4x.h"
-#include <Adafruit_ADS1X15.h>
+#include "ICM_20948.h"
+#include <TinyGPSPlus.h>
+#include <LoRa.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
 
 // ==============================================================================
 // HARDWARE CONFIGURATION
-// (Addresses from your second code file have been added here)
 // ==============================================================================
-#define SERVO_PIN 27            
-#define BNO08X_I2C_ADDR 0x4B
-#define BMP_I2C_ADDR    0x77
-#define ADS_ADDR        0x48
+#define LPS22_ADDR      0x5D
+#define BME_ADDR        0x77
+#define ICM_ADDR        0x69
 #define OLED_ADDR       0x3C
-#define BME_ADDR        0x76    // <-- ADDED THIS
-#define LPS22_ADDR      0x5C    // <-- ADDED THIS
+#define SCREEN_WIDTH    128
+#define SCREEN_HEIGHT   64
 
-#define SCREEN_WIDTH 128
-#define SCREEN_HEIGHT 64
+// ==============================================================================
+// STATE MACHINE CONFIGURATION
+// ==============================================================================
+#define LAUNCH_DETECT_ACCEL_G       3.0f    // Acceleration threshold for launch detection
+#define APOGEE_ALTITUDE_DROP_M      10.0f   // Altitude drop to detect apogee
+#define DEPLOY_ALTITUDE_M           500.0f  // Altitude for aerobrake release
+#define DEPLOY_TOLERANCE_M          10.0f   // Tolerance for deployment altitude
+#define LANDING_SPEED_THRESHOLD     1.0f    // m/s - speed below which we consider landed
+#define LANDING_ALTITUDE_M          5.0f    // meters above ground to consider landed
+#define MIN_ASCENT_ALTITUDE_M       50.0f   // Minimum altitude to consider in ascent
 
-// SECTION: SENSOR & ACTUATOR OBJECTS
+// ==============================================================================
+// SENSOR & ACTUATOR OBJECTS
+// ==============================================================================
 Adafruit_LPS22 lps = Adafruit_LPS22();
 Adafruit_Sensor *lps_pressure = NULL;
 Adafruit_Sensor *lps_temp = NULL;
 TinyGPSPlus gps;
 Adafruit_SHT4x sht41 = Adafruit_SHT4x();
-Adafruit_ADS1115 ads;
 Bsec bme680;
+ICM_20948_I2C myICM;
 Servo myServo;
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
-Adafruit_BMP3XX bmp;
-Adafruit_BNO08x bno = Adafruit_BNO08x();
-sh2_SensorValue_t bnoSensorValue;
 
-// SECTION: GLOBAL OBJECTS & VARIABLES
+// ==============================================================================
+// FLIGHT STATE ENUM
+// ==============================================================================
 enum FlightState {
-    BOOT, LAUNCH_PAD, ASCENT, DESCENT, RECOVERY
+    BOOT = 0,
+    TEST_MODE = 1,
+    LAUNCH_PAD = 2,
+    ASCENT = 3,
+    ROCKET_DEPLOY = 4,
+    DESCENT = 5,
+    AEROBREAK_RELEASE = 6,
+    IMPACT = 7
 };
 
+// ==============================================================================
+// GLOBAL STATE VARIABLES
+// ==============================================================================
 volatile bool isInTestMode = false;
 bool sdCardOK = false;
 
+// Sensor status flags
+bool lps_ok = false, sht_ok = false, bme_ok = false, icm_ok = false;
+bool servo_ok = false, lora_ok = false, oled_ok = false;
+
+volatile FlightState currentFlightState = BOOT;
+FlightState previousFlightState = BOOT;
+
+// State machine tracking variables
+float maxAltitude = 0.0f;
+float groundAltitude = 0.0f;
+bool altitudeCalibrated = false;
+unsigned long stateEntryTime = 0;
+unsigned long launchDetectTime = 0;
+bool aerobrakeDeployed = false;
+bool primaryParachuteDeployed = false;
+
+// Moving average for altitude stability check
+#define ALT_BUFFER_SIZE 10
+float altitudeBuffer[ALT_BUFFER_SIZE] = {0};
+int altBufferIndex = 0;
+
+// ==============================================================================
+// TELEMETRY DATA STRUCTURE
+// ==============================================================================
 volatile struct TelemetryData {
     unsigned long packetCount = 0;
     float timeStamp = 0.0;
-    float altitude = 0.0;
-    float pressure = 0.0;
-    float temperature = 0.0;
-    float voltage = 0.0;
     FlightState flightState = BOOT;
+    float altitude = NAN;
+    float pressure = NAN;
+    float temperature = NAN;
+    float voltage = NAN;
     float gnssLatitude = 0.0, gnssLongitude = 0.0, gnssAltitude = 0.0;
     int gnssSatellites = 0;
-    
-    // IMU Data from BNO08x
-    float bno_qi=NAN, bno_qj=NAN, bno_qk=NAN, bno_qr=NAN;
-
-    // SHT41 Data
-    float sht41_temperature = 0.0;
-    float sht41_humidity = 0.0;
-
-    // BME680 Data (Redundancy + Air Quality)
-    float bme680_pressure = 0.0;
-    float bme680_temperature = 0.0;
-    float bme680_humidity = 0.0;
-    float bme680_gas_resistance = 0.0;
-    float bme680_iaq = 0.0;
-
-    // BMP390 Data (Redundancy)
-    float bmp_temp=NAN, bmp_pressure=NAN;
-
-    // ADS1115 Data (Payload Sensor)
-    float payload_sensor_voltage = 0.0;
-
+    float imu_ax = NAN, imu_ay = NAN, imu_az = NAN;
+    float imu_gx = NAN, imu_gy = NAN, imu_gz = NAN;
+    float imu_mx = NAN, imu_my = NAN, imu_mz = NAN;
+    float sht41_temperature = NAN;
+    float sht41_humidity = NAN;
+    float bme680_pressure = NAN;
+    float bme680_temperature = NAN;
+    float bme680_humidity = NAN;
+    float bme680_gas_resistance = NAN;
+    float bme680_iaq = NAN;
+    float verticalSpeed = 0.0f; // Derived from altitude
 } telemetryData;
 
 TaskHandle_t Task_Core0, Task_Core1;
 File dataFile, eventFile;
+String dataFileName = "";
+String eventFileName = "";
+SemaphoreHandle_t spiMutex;
 
-// NEW: Boolean flags to track sensor status
-bool oled_ok=false, lps_ok=false, bmp_ok=false, bno_ok=false;
-bool sht_ok=false, ads_ok=false, bme_ok=false, servo_ok=false;
-
-volatile FlightState currentFlightState = BOOT;
-
-// SECTION: FUNCTION PROTOTYPES
+// ==============================================================================
+// FUNCTION PROTOTYPES
+// ==============================================================================
+void scanI2CBus();
 void logEvent(String eventMessage);
 void logDataToSD();
 void core0_Task(void *pvParameters);
@@ -123,68 +143,82 @@ void readIMU();
 void readVoltage();
 void readSHT41();
 void readBME680();
-void readBMP390();
-void readADS1115();
 void checkIaqSensorStatus(void);
 void updateFlightState();
 void manageActuators();
-void sendTelemetry();
-void receiveCommands();
+void sendLoRaTelemetry();
+void receiveLoRaCommands();
 void processCommand(String command);
 void displayTelemetry();
+String getNextFileName(String baseName, String extension);
+void calibrateGroundAltitude();
+float calculateVerticalSpeed();
+void updateAltitudeBuffer(float alt);
+bool isAltitudeStable();
+void transitionToState(FlightState newState);
+const char* getStateName(FlightState state);
 
 // ==============================================================================
-// SETUP: Runs once on boot.
+// SETUP
 // ==============================================================================
 void setup() {
     DEBUG_SERIAL.begin(115200);
-    delay(1000);
+    delay(2000);
 
     pinMode(STATUS_LED_PIN, OUTPUT);
-    digitalWrite(STATUS_LED_PIN, HIGH); // Turn on LED during setup
+    pinMode(BUZZER_PIN, OUTPUT);
+    digitalWrite(STATUS_LED_PIN, HIGH);
+    digitalWrite(BUZZER_PIN, LOW);
 
     DEBUG_SERIAL.println("======================================");
     DEBUG_SERIAL.printf("CANSAT %s BOOTING...\n", TEAM_ID);
     
-    isInTestMode = false;
-
     Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
-    Wire.setClock(400000); // Use 400kHz I2C speed for faster sensor reads
-    XBEE_SERIAL.begin(9600);
-    GPS_SERIAL.begin(9600, SERIAL_8N1, 13, 12);
+    Wire.setClock(400000);
 
-    if (!SD.begin(SD_CS_PIN, SPI)) {
+    spiMutex = xSemaphoreCreateMutex();
+    if (spiMutex == NULL) {
+        DEBUG_SERIAL.println("CRITICAL: Failed to create SPI mutex!");
+    }
+
+    scanI2CBus();
+
+    GPS_SERIAL.begin(9600, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+    SPI.begin(SPI_SCK_PIN, SPI_MISO_PIN, SPI_MOSI_PIN);
+
+    if (!SD.begin(SD_CS_PIN)) {
         sdCardOK = false;
         logEvent("CRITICAL: SD Card initialization failed!");
     } else {
         sdCardOK = true;
-        dataFile = SD.open("/data_log.csv", FILE_APPEND);
-        if (dataFile && dataFile.size() < 20) {
-            // Updated header with new sensor data
-            dataFile.println("TeamID,Timestamp,Packet,State,Altitude,Pressure,Temp,Voltage,Lat,Lon,Sats,BNO_qi,BNO_qj,BNO_qk,BNO_qr,SHT_Temp,SHT_Hum,BME_Press,BME_Temp,BME_Hum,BME_Gas,BME_IAQ,BMP_Press,BMP_Temp,ADS_V");
-        }
-        if (dataFile) dataFile.close();
-
-        eventFile = SD.open("/events.csv", FILE_APPEND);
-        if (eventFile && eventFile.size() < 20) {
-            eventFile.println("Timestamp,Event");
-        }
-        if (eventFile) eventFile.close();
         
-        logEvent("SD Card Initialized. System Ready.");
+        dataFileName = getNextFileName("data_", ".csv");
+        eventFileName = getNextFileName("events_", ".csv");
+        
+        dataFile = SD.open(dataFileName, FILE_WRITE);
+        if (dataFile) {
+            dataFile.println("TeamID,Timestamp,Packet,State,Altitude,Pressure,Temp,Voltage,Lat,Lon,Sats,Ax,Ay,Az,Gx,Gy,Gz,Mx,My,Mz,SHT_Temp,SHT_Hum,BME_Press,BME_Temp,BME_Hum,BME_Gas,BME_IAQ,VerticalSpeed");
+            dataFile.close();
+        }
+        
+        eventFile = SD.open(eventFileName, FILE_WRITE);
+        if (eventFile) {
+            eventFile.println("Timestamp,Event");
+            eventFile.close();
+        }
+        
+        logEvent("SD Card Initialized. Data: " + dataFileName + ", Events: " + eventFileName);
     }
     
     setupSensors();
-    pinMode(BUZZER_PIN, OUTPUT);
     
-    logEvent("System booted. Defaulting to FLIGHT MODE.");
     logEvent("Boot complete. Creating tasks.");
-    currentFlightState = LAUNCH_PAD;
+    transitionToState(LAUNCH_PAD);
     
-    xTaskCreatePinnedToCore(core0_Task, "Core0_Pilot", 10000, NULL, 2, &Task_Core0, 0);
+    xTaskCreatePinnedToCore(core0_Task, "Core0_Sensors", 10000, NULL, 2, &Task_Core0, 0);
     xTaskCreatePinnedToCore(core1_Task, "Core1_Comms", 10000, NULL, 1, &Task_Core1, 1);
 
-    digitalWrite(STATUS_LED_PIN, LOW); // Turn off LED after setup
+    digitalWrite(STATUS_LED_PIN, LOW);
 }
 
 void loop() {
@@ -192,7 +226,7 @@ void loop() {
 }
 
 // ==============================================================================
-// CORE 0 TASK: Handles sensors, flight logic, display, actuators, and logging.
+// CORE TASKS
 // ==============================================================================
 void core0_Task(void *pvParameters) {
     TickType_t xLastWakeTime = xTaskGetTickCount();
@@ -207,190 +241,513 @@ void core0_Task(void *pvParameters) {
         updateFlightState();
         manageActuators();
         logDataToSD();
-        displayTelemetry(); // Update the OLED display
+        displayTelemetry();
         
         vTaskDelayUntil(&xLastWakeTime, xFrequency);
     }
 }
 
-// ==============================================================================
-// CORE 1 TASK: Handles telemetry transmission and command reception.
-// ==============================================================================
 void core1_Task(void *pvParameters) {
     TickType_t xLastWakeTime = xTaskGetTickCount();
     const TickType_t xFrequency = pdMS_TO_TICKS(1000 / CORE_1_LOOP_RATE_HZ);
-
     for (;;) {
-        sendTelemetry();
-        receiveCommands();
+        sendLoRaTelemetry();
+        receiveLoRaCommands();
         vTaskDelayUntil(&xLastWakeTime, xFrequency);
     }
 }
 
 // ==============================================================================
-// DATA LOGGING FUNCTIONS
+// STATE TRANSITION MANAGEMENT
+// ==============================================================================
+void transitionToState(FlightState newState) {
+    if (newState != currentFlightState) {
+        previousFlightState = currentFlightState;
+        currentFlightState = newState;
+        stateEntryTime = millis();
+        
+        String stateMsg = "State transition: " + String(getStateName(previousFlightState)) + 
+                         " -> " + String(getStateName(newState));
+        logEvent(stateMsg);
+        
+        // Buzzer feedback for critical state changes
+        if (newState == ASCENT || newState == ROCKET_DEPLOY || newState == IMPACT) {
+            for (int i = 0; i < 3; i++) {
+                digitalWrite(BUZZER_PIN, HIGH);
+                delay(100);
+                digitalWrite(BUZZER_PIN, LOW);
+                delay(100);
+            }
+        }
+    }
+}
+
+const char* getStateName(FlightState state) {
+    switch (state) {
+        case BOOT: return "BOOT";
+        case TEST_MODE: return "TEST_MODE";
+        case LAUNCH_PAD: return "LAUNCH_PAD";
+        case ASCENT: return "ASCENT";
+        case ROCKET_DEPLOY: return "ROCKET_DEPLOY";
+        case DESCENT: return "DESCENT";
+        case AEROBREAK_RELEASE: return "AEROBREAK_RELEASE";
+        case IMPACT: return "IMPACT";
+        default: return "UNKNOWN";
+    }
+}
+
+// ==============================================================================
+// ALTITUDE TRACKING FUNCTIONS
+// ==============================================================================
+void calibrateGroundAltitude() {
+    if (!lps_ok || isnan(telemetryData.altitude)) return;
+    
+    groundAltitude = telemetryData.altitude;
+    altitudeCalibrated = true;
+    logEvent("Ground altitude calibrated to: " + String(groundAltitude, 2) + " m");
+}
+
+void updateAltitudeBuffer(float alt) {
+    altitudeBuffer[altBufferIndex] = alt;
+    altBufferIndex = (altBufferIndex + 1) % ALT_BUFFER_SIZE;
+}
+
+bool isAltitudeStable() {
+    float sum = 0;
+    float mean = 0;
+    float variance = 0;
+    
+    for (int i = 0; i < ALT_BUFFER_SIZE; i++) {
+        sum += altitudeBuffer[i];
+    }
+    mean = sum / ALT_BUFFER_SIZE;
+    
+    for (int i = 0; i < ALT_BUFFER_SIZE; i++) {
+        variance += pow(altitudeBuffer[i] - mean, 2);
+    }
+    variance /= ALT_BUFFER_SIZE;
+    
+    return (sqrt(variance) < 2.0f); // Less than 2m standard deviation
+}
+
+float calculateVerticalSpeed() {
+    static float lastAltitude = 0.0f;
+    static unsigned long lastTime = 0;
+    
+    unsigned long currentTime = millis();
+    float currentAlt = telemetryData.altitude;
+    
+    if (lastTime == 0 || isnan(currentAlt)) {
+        lastTime = currentTime;
+        lastAltitude = currentAlt;
+        return 0.0f;
+    }
+    
+    float deltaTime = (currentTime - lastTime) / 1000.0f; // Convert to seconds
+    if (deltaTime < 0.1f) return telemetryData.verticalSpeed; // Use previous value
+    
+    float speed = (currentAlt - lastAltitude) / deltaTime;
+    lastAltitude = currentAlt;
+    lastTime = currentTime;
+    
+    return speed;
+}
+
+// ==============================================================================
+// ENHANCED STATE MACHINE
+// ==============================================================================
+void updateFlightState() {
+    telemetryData.flightState = currentFlightState;
+    
+    // Update vertical speed
+    telemetryData.verticalSpeed = calculateVerticalSpeed();
+    
+    // Update altitude buffer for stability checks
+    if (!isnan(telemetryData.altitude)) {
+        updateAltitudeBuffer(telemetryData.altitude);
+    }
+    
+    // Get relative altitude
+    float relativeAlt = altitudeCalibrated ? 
+                       (telemetryData.altitude - groundAltitude) : telemetryData.altitude;
+    
+    // Compute acceleration magnitude
+    float accelMagnitude = sqrt(pow(telemetryData.imu_ax, 2) + 
+                               pow(telemetryData.imu_ay, 2) + 
+                               pow(telemetryData.imu_az, 2));
+    
+    // STATE MACHINE LOGIC
+    switch (currentFlightState) {
+        
+        case BOOT:
+            // Should transition to LAUNCH_PAD after setup
+            break;
+            
+        case TEST_MODE:
+            // In test mode, stay here unless commanded otherwise
+            if (!isInTestMode) {
+                transitionToState(LAUNCH_PAD);
+            }
+            // Send telemetry and wait for commands
+            
+            break;
+            
+        case LAUNCH_PAD:
+            // Calibrate ground altitude if not done
+            if (!altitudeCalibrated && lps_ok) {
+                calibrateGroundAltitude();
+            }
+            
+            // Detect launch by high acceleration
+            if (accelMagnitude > LAUNCH_DETECT_ACCEL_G) {
+                launchDetectTime = millis();
+                transitionToState(ASCENT);
+                primaryParachuteDeployed = true; // Deployed at ejection
+            }
+            break;
+            
+        case ASCENT:
+            // Track maximum altitude
+            if (relativeAlt > maxAltitude) {
+                maxAltitude = relativeAlt;
+            }
+            
+            // Detect apogee (altitude starts dropping)
+            if (maxAltitude > MIN_ASCENT_ALTITUDE_M && 
+                relativeAlt < (maxAltitude - APOGEE_ALTITUDE_DROP_M)) {
+                transitionToState(ROCKET_DEPLOY);
+            }
+            
+            // Safety timeout - if in ascent for more than 2 minutes
+            if ((millis() - stateEntryTime) > 120000) {
+                logEvent("ASCENT timeout - forcing ROCKET_DEPLOY");
+                transitionToState(ROCKET_DEPLOY);
+            }
+            break;
+            
+        case ROCKET_DEPLOY:
+            // This state represents apogee and separation
+            // Transition immediately to descent
+            transitionToState(DESCENT);
+            break;
+            
+        case DESCENT:
+            // Check if we've reached deployment altitude
+            if (relativeAlt <= (DEPLOY_ALTITUDE_M + DEPLOY_TOLERANCE_M) &&
+                !aerobrakeDeployed) {
+                transitionToState(AEROBREAK_RELEASE);
+            }
+            
+            // Check for landing
+            if (relativeAlt < LANDING_ALTITUDE_M && 
+                abs(telemetryData.verticalSpeed) < LANDING_SPEED_THRESHOLD) {
+                transitionToState(IMPACT);
+            }
+            
+            // Safety check - if altitude is very low
+            if (relativeAlt < 10.0f && (millis() - stateEntryTime) > 5000) {
+                transitionToState(IMPACT);
+            }
+            break;
+            
+        case AEROBREAK_RELEASE:
+            // Stay in this state briefly, then return to descent
+            if ((millis() - stateEntryTime) > 2000) {
+                transitionToState(DESCENT);
+            }
+            
+            // Also check for landing
+            if (relativeAlt < LANDING_ALTITUDE_M && 
+                abs(telemetryData.verticalSpeed) < LANDING_SPEED_THRESHOLD) {
+                transitionToState(IMPACT);
+            }
+            break;
+            
+        case IMPACT:
+            // Terminal state - activate beacon
+            // Could implement automatic mode reset after extended period
+            if ((millis() - stateEntryTime) > 300000) { // 5 minutes
+                logEvent("Extended ground time - system stabilized");
+            }
+            break;
+    }
+}
+
+// ==============================================================================
+// ACTUATOR MANAGEMENT
+// ==============================================================================
+void manageActuators() {
+    switch (currentFlightState) {
+        case BOOT:
+        case TEST_MODE:
+        case LAUNCH_PAD:
+            // Servo at neutral position
+            if (servo_ok && myServo.read() != 0) {
+                myServo.write(0);
+            }
+            // Buzzer off
+            digitalWrite(BUZZER_PIN, LOW);
+            break;
+            
+        case ASCENT:
+            // Keep servo at neutral during ascent
+            if (servo_ok && myServo.read() != 0) {
+                myServo.write(0);
+            }
+            break;
+            
+        case ROCKET_DEPLOY:
+            // No actuator action needed at apogee
+            break;
+            
+        case DESCENT:
+            // Primary parachute is already deployed
+            // Keep servo at neutral until aerobrake release
+            if (servo_ok && myServo.read() != 0) {
+                myServo.write(0);
+            }
+            break;
+            
+        case AEROBREAK_RELEASE:
+            // Deploy aerobrake/secondary parachute
+            if (!aerobrakeDeployed && servo_ok) {
+                myServo.write(90); // Deploy position
+                aerobrakeDeployed = true;
+                logEvent("AEROBRAKE DEPLOYED at altitude: " + 
+                        String(telemetryData.altitude - groundAltitude, 2) + " m");
+                
+                // Buzzer confirmation
+                for (int i = 0; i < 5; i++) {
+                    digitalWrite(BUZZER_PIN, HIGH);
+                    delay(50);
+                    digitalWrite(BUZZER_PIN, LOW);
+                    delay(50);
+                }
+            }
+            break;
+            
+        case IMPACT:
+            // Activate audio beacon continuously
+            static unsigned long lastBeepTime = 0;
+            if (millis() - lastBeepTime > 1000) {
+                digitalWrite(BUZZER_PIN, HIGH);
+                delay(200);
+                digitalWrite(BUZZER_PIN, LOW);
+                lastBeepTime = millis();
+            }
+            
+            // Return servo to neutral
+            if (servo_ok && myServo.read() != 90) {
+                myServo.write(0);
+            }
+            break;
+    }
+}
+
+// ==============================================================================
+// I2C BUS SCANNER
+// ==============================================================================
+void scanI2CBus() {
+    DEBUG_SERIAL.println("Scanning I2C bus...");
+    byte error, address;
+    int nDevices = 0;
+    for (address = 1; address < 127; address++) {
+        Wire.beginTransmission(address);
+        error = Wire.endTransmission();
+        if (error == 0) {
+            DEBUG_SERIAL.print(" - I2C device found at address 0x");
+            if (address < 16) DEBUG_SERIAL.print("0");
+            DEBUG_SERIAL.println(address, HEX);
+            nDevices++;
+        }
+    }
+    if (nDevices == 0) {
+        logEvent("CRITICAL: No I2C devices found! Check wiring.");
+    } else {
+        DEBUG_SERIAL.println("-> Scan complete.");
+    }
+}
+
+// ==============================================================================
+// DATA LOGGING
 // ==============================================================================
 void logEvent(String eventMessage) {
     String logEntryCSV = String(millis() / 1000.0, 2) + "," + eventMessage;
     String logEntryHuman = "EVENT: " + String(millis() / 1000.0, 2) + "s: " + eventMessage;
     DEBUG_SERIAL.println(logEntryHuman);
-    if (sdCardOK) {
-        eventFile = SD.open("/events.csv", FILE_APPEND);
-        if (eventFile) {
-            eventFile.println(logEntryCSV);
-            eventFile.close();
+    if (sdCardOK && eventFileName.length() > 0) {
+        if (xSemaphoreTake(spiMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+            eventFile = SD.open(eventFileName, FILE_APPEND);
+            if (eventFile) {
+                eventFile.println(logEntryCSV);
+                eventFile.close();
+            }
+            xSemaphoreGive(spiMutex);
         }
     }
 }
 
 void logDataToSD() {
-    if (!sdCardOK) return;
+    if (!sdCardOK || dataFileName.length() == 0) return;
     
-    dataFile = SD.open("/data_log.csv", FILE_APPEND);
-    if (dataFile) {
-        char dataString[500]; // Increased buffer for new data
-        snprintf(dataString, sizeof(dataString), "%s,%.2f,%lu,%d,%.2f,%.0f,%.2f,%.2f,%.4f,%.4f,%d,%.4f,%.4f,%.4f,%.4f,%.2f,%.2f,%.0f,%.2f,%.2f,%.0f,%.1f,%.0f,%.2f,%.3f",
-            TEAM_ID, telemetryData.timeStamp, telemetryData.packetCount, telemetryData.flightState,
-            telemetryData.altitude, telemetryData.pressure, telemetryData.temperature, telemetryData.voltage,
-            telemetryData.gnssLatitude, telemetryData.gnssLongitude, telemetryData.gnssSatellites,
-            telemetryData.bno_qi, telemetryData.bno_qj, telemetryData.bno_qk, telemetryData.bno_qr, // New IMU data
-            telemetryData.sht41_temperature, telemetryData.sht41_humidity,
-            telemetryData.bme680_pressure, telemetryData.bme680_temperature, telemetryData.bme680_humidity,
-            telemetryData.bme680_gas_resistance, telemetryData.bme680_iaq,
-            telemetryData.bmp_pressure, telemetryData.bmp_temp, // New BMP390 data
-            telemetryData.payload_sensor_voltage);
-        dataFile.println(dataString);
-        dataFile.close();
+    if (xSemaphoreTake(spiMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        dataFile = SD.open(dataFileName, FILE_APPEND);
+        if (dataFile) {
+            char dataString[500];
+            snprintf(dataString, sizeof(dataString), 
+                "%s,%.2f,%lu,%d,%.2f,%.0f,%.2f,%.2f,%.6f,%.6f,%d,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.0f,%.2f,%.2f,%.0f,%.1f,%.2f",
+                TEAM_ID, telemetryData.timeStamp, telemetryData.packetCount, 
+                telemetryData.flightState, telemetryData.altitude, 
+                telemetryData.pressure, telemetryData.temperature, 
+                telemetryData.voltage, telemetryData.gnssLatitude, 
+                telemetryData.gnssLongitude, telemetryData.gnssSatellites,
+                telemetryData.imu_ax, telemetryData.imu_ay, telemetryData.imu_az,
+                telemetryData.imu_gx, telemetryData.imu_gy, telemetryData.imu_gz,
+                telemetryData.imu_mx, telemetryData.imu_my, telemetryData.imu_mz,
+                telemetryData.sht41_temperature, telemetryData.sht41_humidity,
+                telemetryData.bme680_pressure, telemetryData.bme680_temperature, 
+                telemetryData.bme680_humidity, telemetryData.bme680_gas_resistance, 
+                telemetryData.bme680_iaq, telemetryData.verticalSpeed);
+            dataFile.println(dataString);
+            dataFile.close();
+        }
+        xSemaphoreGive(spiMutex);
     }
 }
 
 // ==============================================================================
-// SENSOR SETUP AND READING FUNCTIONS
-// ==============================================================================
-// ==============================================================================
-// SENSOR SETUP AND READING FUNCTIONS (ROBUST VERSION)
+// SENSOR SETUP
 // ==============================================================================
 void setupSensors() {
-    logEvent("Initializing sensors (robust check)...");
+    logEvent("Initializing detected sensors...");
 
-    // OLED Display
-    DEBUG_SERIAL.print("Initializing OLED... ");
-    if (display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
-        display.clearDisplay();
-        display.setTextSize(1);
-        display.setTextColor(SSD1306_WHITE);
-        display.setCursor(0,0);
-        display.println("Sensors Init...");
-        display.display();
-        oled_ok = true;
-        DEBUG_SERIAL.println("OK");
-    } else {
-        DEBUG_SERIAL.println("FAILED!");
-    }
-
-    // Servo
-    DEBUG_SERIAL.print("Initializing Servo... ");
-    ESP32PWM::allocateTimer(0);
-    if (myServo.attach(SERVO_PIN)) {
-        servo_ok = true;
-        DEBUG_SERIAL.println("OK");
-    } else {
-        DEBUG_SERIAL.println("FAILED!");
-    }
-
-    // LPS22 (Primary Barometer)
-    DEBUG_SERIAL.print("Initializing LPS22 (0x5C)... ");
-    if (lps.begin_I2C(LPS22_ADDR)) {
-        lps_pressure = lps.getPressureSensor();
-        lps_temp = lps.getTemperatureSensor();
-        lps_ok = true;
-        DEBUG_SERIAL.println("OK");
-    } else {
-        DEBUG_SERIAL.println("FAILED!");
-    }
-    
-    // BMP390 (Secondary Barometer)
-    DEBUG_SERIAL.print("Initializing BMP390 (0x77)... ");
-    if (bmp.begin_I2C(BMP_I2C_ADDR)) {
-        bmp.setTemperatureOversampling(BMP3_OVERSAMPLING_8X);
-        bmp.setPressureOversampling(BMP3_OVERSAMPLING_4X);
-        bmp_ok = true;
-        DEBUG_SERIAL.println("OK");
-    } else {
-        DEBUG_SERIAL.println("FAILED!");
-    }
-    
-    // BNO08x (IMU)
-    DEBUG_SERIAL.print("Initializing BNO08x (0x4B)... ");
-    if (bno.begin_I2C(BNO08X_I2C_ADDR)) {
-        if (bno.enableReport(SH2_ROTATION_VECTOR)) {
-            bno_ok = true;
+    Wire.beginTransmission(OLED_ADDR);
+    if (Wire.endTransmission() == 0) {
+        DEBUG_SERIAL.print("Initializing OLED... ");
+        if (display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
+            display.clearDisplay();
+            display.setTextSize(1);
+            display.setTextColor(SSD1306_WHITE);
+            display.setCursor(0, 0);
+            display.println("OLED OK");
+            display.display();
+            oled_ok = true;
             DEBUG_SERIAL.println("OK");
         } else {
-            DEBUG_SERIAL.println("FAILED to enable report!");
+            DEBUG_SERIAL.println("FAILED!");
         }
     } else {
-        DEBUG_SERIAL.println("FAILED!");
+        logEvent("OLED not found on I2C bus.");
     }
 
-    // SHT41 (Humidity)
+    Wire.beginTransmission(LPS22_ADDR);
+    if (Wire.endTransmission() == 0) {
+        DEBUG_SERIAL.print("Initializing LPS22... ");
+        if (lps.begin_I2C(LPS22_ADDR)) {
+            lps_pressure = lps.getPressureSensor();
+            lps_temp = lps.getTemperatureSensor();
+            lps_ok = true;
+            DEBUG_SERIAL.println("OK");
+        } else {
+            DEBUG_SERIAL.println("FAILED!");
+        }
+    } else {
+        logEvent("LPS22 not found on I2C bus.");
+    }
+    
+    Wire.beginTransmission(ICM_ADDR);
+    if (Wire.endTransmission() == 0) {
+        DEBUG_SERIAL.print("Initializing ICM-20948... ");
+        myICM.begin(Wire, ICM_ADDR);
+        if (myICM.status == ICM_20948_Stat_Ok) {
+            icm_ok = true;
+            DEBUG_SERIAL.println("OK");
+        } else {
+            DEBUG_SERIAL.println("FAILED!");
+        }
+    } else {
+        logEvent("ICM-20948 not found on I2C bus.");
+    }
+
     DEBUG_SERIAL.print("Initializing SHT41... ");
     if (sht41.begin()) {
         sht_ok = true;
         DEBUG_SERIAL.println("OK");
     } else {
         DEBUG_SERIAL.println("FAILED!");
-    }
-
-    // ADS1115 (ADC)
-    DEBUG_SERIAL.print("Initializing ADS1115 (0x48)... ");
-    if (ads.begin(ADS_ADDR)) {
-        ads.setGain(GAIN_ONE);
-        ads_ok = true;
-        DEBUG_SERIAL.println("OK");
-    } else {
-        DEBUG_SERIAL.println("FAILED!");
+        logEvent("SHT41 not found or failed to init.");
     }
     
-    // BME680 (Air Quality)
-    DEBUG_SERIAL.print("Initializing BME680 (0x76)... ");
-    bme680.begin(BME_ADDR, Wire); 
-    if (bme680.bsecStatus == BSEC_OK && bme680.bme68xStatus == BME68X_OK) {
-        bsec_virtual_sensor_t sensorList[10] = { BSEC_OUTPUT_RAW_TEMPERATURE, BSEC_OUTPUT_RAW_PRESSURE, BSEC_OUTPUT_RAW_HUMIDITY, BSEC_OUTPUT_RAW_GAS, BSEC_OUTPUT_IAQ, BSEC_OUTPUT_STATIC_IAQ, BSEC_OUTPUT_CO2_EQUIVALENT, BSEC_OUTPUT_BREATH_VOC_EQUIVALENT, BSEC_OUTPUT_STABILIZATION_STATUS, BSEC_OUTPUT_RUN_IN_STATUS };
-        bme680.updateSubscription(sensorList, 10, BSEC_SAMPLE_RATE_LP);
-        bme_ok = true;
+    Wire.beginTransmission(BME_ADDR);
+    if (Wire.endTransmission() == 0) {
+        DEBUG_SERIAL.print("Initializing BME680... ");
+        bme680.begin(BME_ADDR, Wire);
+        if (bme680.bsecStatus == BSEC_OK && bme680.bme68xStatus == BME68X_OK) {
+            bsec_virtual_sensor_t sensorList[] = {
+                BSEC_OUTPUT_RAW_TEMPERATURE, BSEC_OUTPUT_RAW_PRESSURE, 
+                BSEC_OUTPUT_RAW_HUMIDITY, BSEC_OUTPUT_RAW_GAS, BSEC_OUTPUT_IAQ
+            };
+            bme680.updateSubscription(sensorList, 5, BSEC_SAMPLE_RATE_LP);
+            bme_ok = true;
+            DEBUG_SERIAL.println("OK");
+        } else {
+            DEBUG_SERIAL.println("FAILED!");
+            checkIaqSensorStatus();
+        }
+    } else {
+        logEvent("BME680 not found on I2C bus.");
+    }
+
+    DEBUG_SERIAL.print("Initializing Servo... ");
+    ESP32PWM::allocateTimer(0);
+    if (myServo.attach(SERVO_PIN)) {
+        servo_ok = true;
+        myServo.write(0); // Start at neutral
         DEBUG_SERIAL.println("OK");
     } else {
         DEBUG_SERIAL.println("FAILED!");
     }
+
+    DEBUG_SERIAL.print("Initializing LoRa SX1278... ");
+    LoRa.setPins(LORA_SS_PIN, LORA_RST_PIN, LORA_DIO0_PIN);
+    if (!LoRa.begin(433E6)) {
+        DEBUG_SERIAL.println("FAILED!");
+    } else {
+        LoRa.setSyncWord(0xF3);
+        lora_ok = true;
+        DEBUG_SERIAL.println("OK");
+    }
+    
     logEvent("Sensor init check complete.");
 }
 
+// ==============================================================================
+// SENSOR READING
+// ==============================================================================
 void readAllSensors() {
     telemetryData.timeStamp = millis() / 1000.0f;
     
     if (lps_ok) readBarometer();
-    if (bno_ok) readIMU();
+    if (icm_ok) readIMU();
     if (sht_ok) readSHT41();
     if (bme_ok) readBME680();
-    if (bmp_ok) readBMP390();
-    if (ads_ok) readADS1115();
     
-    // These functions don't depend on I2C sensors
     readGPS();
     readVoltage();
 }
 
-void readBarometer() { // LPS22
+void readBarometer() {
     sensors_event_t pressure_event, temp_event;
-    lps_pressure->getEvent(&pressure_event);
-    lps_temp->getEvent(&temp_event);
-    telemetryData.pressure = pressure_event.pressure * 100; // hPa to Pa
-    telemetryData.temperature = temp_event.temperature;
-    
-    // Calculate altitude based on the primary pressure sensor
-    if (telemetryData.pressure > 0) {
-        telemetryData.altitude = 44330 * (1.0f - pow(telemetryData.pressure / (SEALEVELPRESSURE_HPA * 100), 0.1903));
+    if (lps_pressure->getEvent(&pressure_event) && lps_temp->getEvent(&temp_event)) {
+        telemetryData.pressure = pressure_event.pressure * 100;
+        telemetryData.temperature = temp_event.temperature;
+        if (telemetryData.pressure > 0) {
+            telemetryData.altitude = 44330 * (1.0f - pow(telemetryData.pressure / 
+                                       (SEALEVELPRESSURE_HPA * 100), 0.1903));
+        }
+    } else {
+        logEvent("Failed to read LPS22.");
+        lps_ok = false;
     }
 }
 
@@ -406,14 +763,18 @@ void readGPS() {
     }
 }
 
-void readIMU() { // Reads BNO08x
-    if (bno.getSensorEvent(&bnoSensorValue)) {
-      if (bnoSensorValue.sensorId == SH2_ROTATION_VECTOR) {
-        telemetryData.bno_qi = bnoSensorValue.un.rotationVector.i;
-        telemetryData.bno_qj = bnoSensorValue.un.rotationVector.j;
-        telemetryData.bno_qk = bnoSensorValue.un.rotationVector.k;
-        telemetryData.bno_qr = bnoSensorValue.un.rotationVector.real;
-      }
+void readIMU() {
+    if (myICM.dataReady()) {
+        myICM.getAGMT();
+        telemetryData.imu_ax = myICM.accX();
+        telemetryData.imu_ay = myICM.accY();
+        telemetryData.imu_az = myICM.accZ();
+        telemetryData.imu_gx = myICM.gyrX();
+        telemetryData.imu_gy = myICM.gyrY();
+        telemetryData.imu_gz = myICM.gyrZ();
+        telemetryData.imu_mx = myICM.magX();
+        telemetryData.imu_my = myICM.magY();
+        telemetryData.imu_mz = myICM.magZ();
     }
 }
 
@@ -424,13 +785,17 @@ void readVoltage() {
 
 void readSHT41() {
     sensors_event_t humidity, temp;
-    sht41.getEvent(&humidity, &temp);
-    telemetryData.sht41_temperature = temp.temperature;
-    telemetryData.sht41_humidity = humidity.relative_humidity;
+    if (sht41.getEvent(&humidity, &temp)) {
+        telemetryData.sht41_temperature = temp.temperature;
+        telemetryData.sht41_humidity = humidity.relative_humidity;
+    } else {
+        logEvent("Failed to read SHT41.");
+        sht_ok = false;
+    }
 }
 
 void readBME680() {
-    if (bme680.run()) { // This reads the sensor
+    if (bme680.run()) {
         telemetryData.bme680_pressure = bme680.pressure;
         telemetryData.bme680_temperature = bme680.temperature;
         telemetryData.bme680_humidity = bme680.humidity;
@@ -441,244 +806,183 @@ void readBME680() {
     }
 }
 
-void readBMP390() { // Reads secondary barometer
-    if (bmp.performReading()) {
-        telemetryData.bmp_temp = bmp.temperature;
-        telemetryData.bmp_pressure = bmp.pressure;
-    }
-}
-
-void readADS1115() {
-    int16_t adc0 = ads.readADC_SingleEnded(0);
-    // LSB value for GAIN_ONE (+/-4.096V) is 0.125mV
-    telemetryData.payload_sensor_voltage = adc0 * 0.000125F;
-}
-
 void checkIaqSensorStatus(void) {
-    String output = "";
     if (bme680.bsecStatus != BSEC_OK) {
-        if (bme680.bsecStatus < BSEC_OK) output = "BSEC error";
-        else output = "BSEC warning";
-        logEvent(output + ": " + String(bme680.bsecStatus));
+        logEvent("BSEC Error/Warning: " + String(bme680.bsecStatus));
     }
-    
     if (bme680.bme68xStatus != BME68X_OK) {
-        if (bme680.bme68xStatus < BME68X_OK) output = "BME680 error";
-        else output = "BME680 warning";
-        logEvent(output + ": " + String(bme680.bme68xStatus));
+        logEvent("BME680 Error/Warning: " + String(bme680.bme68xStatus));
     }
 }
 
 // ==============================================================================
-// OLED DISPLAY FUNCTION
+// OLED DISPLAY
 // ==============================================================================
 void displayTelemetry() {
+    if (!oled_ok) return;
+
     display.clearDisplay();
-    display.setCursor(0,0);
+    display.setCursor(0, 0);
     display.setTextSize(1);
     
-    display.printf("State: %d Alt: %.1fm\n", telemetryData.flightState, telemetryData.altitude);
-    display.printf("P: %.0fhPa T: %.1fC\n", telemetryData.pressure / 100.0f, telemetryData.temperature);
-    display.printf("Lat: %.3f\nLon: %.3f Sats:%d\n", telemetryData.gnssLatitude, telemetryData.gnssLongitude, telemetryData.gnssSatellites);
-    display.printf("V: %.2fV IAQ: %.0f\n", telemetryData.voltage, telemetryData.bme680_iaq);
-    display.printf("qi:%.2f qj:%.2f\n", telemetryData.bno_qi, telemetryData.bno_qj);
-    display.printf("qk:%.2f qr:%.2f\n", telemetryData.bno_qk, telemetryData.bno_qr);
-
-    display.display();
-}
-
-// ==============================================================================
-// FLIGHT LOGIC & ACTUATORS
-// ==============================================================================
-void updateFlightState() {
-    // NOTE: This is a stub function. Implement your flight state machine logic here.
-    if (isInTestMode) {
-        currentFlightState = LAUNCH_PAD;
-    }
-}
-
-// void manageActuators() {
-//     // This function now contains the NON-BLOCKING servo sweep logic.
-//     // It can be expanded to control other things like buzzers or pyro channels.
+    float relAlt = altitudeCalibrated ? 
+                  (telemetryData.altitude - groundAltitude) : telemetryData.altitude;
     
-//     static int servoPos = 0;
-//     static int servoState = 0; // 0=sweeping up, 1=pausing at top, 2=sweeping down, 3=pausing at bottom
-//     static unsigned long lastServoMoveTime = 0;
-
-//     const int SWEEP_DELAY_MS = 15;
-//     const int PAUSE_DELAY_MS = 2000;
-
-//     if (millis() - lastServoMoveTime > SWEEP_DELAY_MS && (servoState == 0 || servoState == 2)) {
-//         lastServoMoveTime = millis();
-//         if (servoState == 0) { // Sweeping up
-//             servoPos++;
-//             myServo.write(servoPos);
-//             if (servoPos >= 180) {
-//                 servoState = 1; // Switch to pausing at top
-//             }
-//         } else { // Sweeping down
-//             servoPos--;
-//             myServo.write(servoPos);
-//             if (servoPos <= 0) {
-//                 servoState = 3; // Switch to pausing at bottom
-//             }
-//         }
-//     }
-
-//     if (millis() - lastServoMoveTime > PAUSE_DELAY_MS && (servoState == 1 || servoState == 3)) {
-//         lastServoMoveTime = millis();
-//         if (servoState == 1) { // Was pausing at top
-//             servoState = 2; // Switch to sweeping down
-//         } else { // Was pausing at bottom
-//             servoState = 0; // Switch to sweeping up
-//         }
-//     }
-
-//     // Example of other actuator logic
-//     if (currentFlightState == RECOVERY) {
-//         // activate buzzer
-//     }
-// }
-
-void manageActuators() {
-    // Actuator logic is now driven by the current flight state.
-    // Static variables are used for the sweep logic so they retain their values.
-    static int servoPos = 0;
-    static int servoState = 0; // 0=sweeping up, 1=pausing at top, 2=sweeping down, 3=pausing at bottom
-    static unsigned long lastServoMoveTime = 0;
-
-    switch (currentFlightState) {
-        case BOOT:
-        case LAUNCH_PAD:
-            // On the launch pad, hold the servo in its initial, safe position.
-            // This check prevents sending the command repeatedly.
-            if (myServo.read() != 0) {
-                myServo.write(0);
-            }
-            break;
-
-        case ASCENT: {
-            // During ascent, run the continuous sweep logic for testing or control surfaces.
-            const int SWEEP_DELAY_MS = 15;
-            const int PAUSE_DELAY_MS = 2000;
-
-            if (millis() - lastServoMoveTime > SWEEP_DELAY_MS && (servoState == 0 || servoState == 2)) {
-                lastServoMoveTime = millis();
-                if (servoState == 0) { // Sweeping up
-                    servoPos++;
-                    if (servoPos >= 180) {
-                        servoPos = 180;
-                        servoState = 1; // Switch to pausing at top
-                    }
-                } else { // Sweeping down
-                    servoPos--;
-                    if (servoPos <= 0) {
-                        servoPos = 0;
-                        servoState = 3; // Switch to pausing at bottom
-                    }
-                }
-                myServo.write(servoPos);
-            }
-
-            if (millis() - lastServoMoveTime > PAUSE_DELAY_MS && (servoState == 1 || servoState == 3)) {
-                lastServoMoveTime = millis();
-                if (servoState == 1) { // Was pausing at top
-                    servoState = 2; // Switch to sweeping down
-                } else { // Was pausing at bottom
-                    servoState = 0; // Switch to sweeping up
-                }
-            }
-            break;
-        }
-
-        case DESCENT: // <-- SECONDARY PARACHUTE DEPLOYMENT STATE
-            // Move servo to 90 degrees to deploy the parachute.
-            // This check ensures the command is only sent if the servo isn't already there.
-            if (myServo.read() != 90) {
-                myServo.write(90);
-                logEvent("ACTUATOR: Secondary chute servo deployed to 90 deg.");
-            }
-            break;
-
-        case RECOVERY:
-            // During recovery, hold the servo in its deployed position.
-            if (myServo.read() != 90) {
-                myServo.write(90);
-            }
-            // You can also add buzzer logic here.
-            // For example: if (millis() % 2000 > 1000) { digitalWrite(BUZZER_PIN, HIGH); } else { digitalWrite(BUZZER_PIN, LOW); }
-            break;
-            
-        default:
-             // Default to a safe state if the flight state is unknown.
-            if (myServo.read() != 0) {
-                myServo.write(0);
-            }
-            break;
-    }
+    display.printf("S:%s\n", getStateName(currentFlightState));
+    display.printf("Alt:%.1fm (%.1f)\n", telemetryData.altitude, relAlt);
+    display.printf("VS:%.1fm/s Max:%.1f\n", telemetryData.verticalSpeed, maxAltitude);
+    display.printf("P:%.0fPa T:%.1fC\n", telemetryData.pressure, telemetryData.temperature);
+    display.printf("Acc:%.1fg\n", 
+                   sqrt(pow(telemetryData.imu_ax, 2) + 
+                        pow(telemetryData.imu_ay, 2) + 
+                        pow(telemetryData.imu_az, 2)));
+    display.printf("GPS:%d Pkt:%lu\n", telemetryData.gnssSatellites, 
+                   telemetryData.packetCount);
+    display.printf("V:%.2fV T:%.0fs", telemetryData.voltage, telemetryData.timeStamp);
+    display.display();
 }
 
 // ==============================================================================
 // COMMUNICATION FUNCTIONS
 // ==============================================================================
-void sendTelemetry() {
-    telemetryData.packetCount++;
-    char telemetryString[300]; 
+void sendLoRaTelemetry() {
+    if (!lora_ok) return;
     
-    // Updated packet to include BNO08x quaternion data instead of old stubs
-    snprintf(telemetryString, sizeof(telemetryString),
-             "%s,%.2f,%lu,%d,%.2f,%.0f,%.2f,%.2f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%d\r\n",
-             TEAM_ID, 
-             telemetryData.timeStamp, 
-             telemetryData.packetCount,
-             telemetryData.flightState,
-             telemetryData.altitude,
-             telemetryData.pressure, 
-             telemetryData.temperature, 
-             telemetryData.voltage,
-             telemetryData.gnssLatitude, 
-             telemetryData.gnssLongitude, 
-             telemetryData.bno_qi, // IMU Data
-             telemetryData.bno_qj, // IMU Data
-             telemetryData.bno_qk, // IMU Data
-             telemetryData.bno_qr, // IMU Data
-             telemetryData.gnssSatellites);
+    if (xSemaphoreTake(spiMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        telemetryData.packetCount++;
+        char telemetryString[350];
+        
+        float relAlt = altitudeCalibrated ? 
+                      (telemetryData.altitude - groundAltitude) : telemetryData.altitude;
+        
+        snprintf(telemetryString, sizeof(telemetryString),
+                 "%s,%.2f,%lu,%d,%.2f,%.0f,%.2f,%.2f,%.6f,%.6f,%.2f,%.2f,%d,%.2f",
+                 TEAM_ID, 
+                 telemetryData.timeStamp, 
+                 telemetryData.packetCount,
+                 telemetryData.flightState,
+                 relAlt,
+                 telemetryData.pressure, 
+                 telemetryData.temperature, 
+                 telemetryData.voltage,
+                 telemetryData.gnssLatitude, 
+                 telemetryData.gnssLongitude, 
+                 telemetryData.imu_ax,
+                 telemetryData.imu_gy,
+                 telemetryData.gnssSatellites,
+                 telemetryData.verticalSpeed);
 
-    XBEE_SERIAL.print(telemetryString);
-    if(DEBUG_PRINT_ENABLED){
-        DEBUG_SERIAL.print("TX-> " + String(telemetryString));
+        LoRa.beginPacket();
+        LoRa.print(telemetryString);
+        LoRa.endPacket();
+        
+        xSemaphoreGive(spiMutex);
+        
+        if (DEBUG_PRINT_ENABLED) {
+            DEBUG_SERIAL.print("LORA_TX-> " + String(telemetryString) + "\n");
+        }
+    }
+}
+
+void receiveLoRaCommands() {
+    if (!lora_ok) return;
+    
+    if (xSemaphoreTake(spiMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        unsigned long listenStart = millis();
+        const unsigned long LISTEN_WINDOW_MS = 200;
+        
+        while (millis() - listenStart < LISTEN_WINDOW_MS) {
+            int packetSize = LoRa.parsePacket();
+            if (packetSize) {
+                String receivedCommand = "";
+                while (LoRa.available()) {
+                    receivedCommand += (char)LoRa.read();
+                }
+                
+                xSemaphoreGive(spiMutex);
+                
+                if (DEBUG_PRINT_ENABLED) {
+                    DEBUG_SERIAL.println(" | LORA_RX<- " + receivedCommand);
+                }
+                processCommand(receivedCommand);
+                return;
+            }
+            delay(10);
+        }
+        
+        xSemaphoreGive(spiMutex);
     }
 }
 
 void processCommand(String command) {
     command.trim();
     if (command.length() == 0) return;
+    
     logEvent("Command received: " + command);
-
+    
     if (command.equalsIgnoreCase("CMD,SET_MODE,TEST")) {
         if (!isInTestMode) {
             logEvent("SWITCHING TO TEST MODE.");
             isInTestMode = true;
+            transitionToState(TEST_MODE);
         }
-    } else if (command.equalsIgnoreCase("CMD,SET_MODE,FLIGHT")) {
+    } 
+    else if (command.equalsIgnoreCase("CMD,SET_MODE,FLIGHT")) {
         if (isInTestMode) {
             logEvent("SWITCHING TO FLIGHT MODE.");
             isInTestMode = false;
+            transitionToState(LAUNCH_PAD);
         }
-    } else if (command.equalsIgnoreCase("CALIBRATE")) {
-        logEvent("Executing calibration command.");
-    } else {
+    }
+    else if (command.equalsIgnoreCase("CMD,CALIBRATE")) {
+        calibrateGroundAltitude();
+        logEvent("Manual calibration requested");
+    }
+    else if (command.equalsIgnoreCase("CMD,RESET_STATE")) {
+        maxAltitude = 0.0f;
+        aerobrakeDeployed = false;
+        primaryParachuteDeployed = false;
+        transitionToState(LAUNCH_PAD);
+        logEvent("State machine reset to LAUNCH_PAD");
+    }
+    else if (command.equalsIgnoreCase("CMD,DEPLOY_TEST")) {
+        if (currentFlightState == TEST_MODE || currentFlightState == LAUNCH_PAD) {
+            if (servo_ok) {
+                myServo.write(90);
+                delay(1000);
+                myServo.write(0);
+                logEvent("Manual servo deployment test executed");
+            }
+        }
+    }
+    else if (command.equalsIgnoreCase("CMD,STATUS")) {
+        String status = "State:" + String(getStateName(currentFlightState)) + 
+                       " Alt:" + String(telemetryData.altitude, 1) + 
+                       " MaxAlt:" + String(maxAltitude, 1) +
+                       " Deploy:" + String(aerobrakeDeployed ? "Y" : "N");
+        logEvent(status);
+    }
+    else {
         logEvent("Unknown command: " + command);
     }
 }
 
-void receiveCommands() {
-    if (DEBUG_SERIAL.available()) {
-        String command = DEBUG_SERIAL.readStringUntil('\n');
-        processCommand(command);
+// ==============================================================================
+// FILE NAMING FUNCTIONS
+// ==============================================================================
+String getNextFileName(String baseName, String extension) {
+    int fileNumber = 1;
+    String fileName = "/" + baseName + String(fileNumber) + extension;
+    
+    while (SD.exists(fileName)) {
+        fileNumber++;
+        fileName = "/" + baseName + String(fileNumber) + extension;
+        
+        if (fileNumber > 9999) {
+            fileName = "/" + baseName + "9999" + extension;
+            break;
+        }
     }
-    if (XBEE_SERIAL.available()) {
-        String command = XBEE_SERIAL.readStringUntil('\n');
-        processCommand(command);
-    }
-}
+    
+    DEBUG_SERIAL.println("Next available file: " + fileName);
+    return fileName;
