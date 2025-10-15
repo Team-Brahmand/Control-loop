@@ -31,6 +31,21 @@
 #define SCREEN_HEIGHT   64
 
 // ==============================================================================
+// TIMEZONE CONFIGURATION
+// ==============================================================================
+// IST offset: +5 hours and 30 minutes = 330 minutes total offset
+const int IST_OFFSET_MINUTES = 330; 
+// Structure to hold the IST time components
+struct IST_Time {
+    int year = 0;
+    int month = 0;
+    int day = 0;
+    int hour = 0;
+    int minute = 0;
+    int second = 0;
+};
+
+// ==============================================================================
 // STATE MACHINE CONFIGURATION
 // ==============================================================================
 #define LAUNCH_DETECT_ACCEL_G       3.0f    // Acceleration threshold for launch detection
@@ -101,6 +116,7 @@ int altBufferIndex = 0;
 volatile struct TelemetryData {
     unsigned long packetCount = 0;
     float timeStamp = 0.0;
+    IST_Time istTime; // NEW: Holds the calculated IST time
     FlightState flightState = BOOT;
     float altitude = NAN;
     float pressure = NAN;
@@ -726,6 +742,7 @@ void setupSensors() {
 // ==============================================================================
 void readAllSensors() {
     telemetryData.timeStamp = millis() / 1000.0f;
+    telemetryData.packetCount++; // Increment packet count here
     
     if (lps_ok) readBarometer();
     if (icm_ok) readIMU();
@@ -751,6 +768,61 @@ void readBarometer() {
     }
 }
 
+// ==============================================================================
+// IST TIME CONVERSION
+// ==============================================================================
+void calculateIST(volatile IST_Time &istTime)
+{
+    if (!gps.date.isValid() || !gps.time.isValid()) {
+        istTime.year = 0;
+        return; // Return if GPS time/date is not valid
+    }
+
+    // Get UTC values
+    int utcHour = gps.time.hour();
+    int utcMinute = gps.time.minute();
+    int utcSecond = gps.time.second();
+    int utcDay = gps.date.day();
+    int utcMonth = gps.date.month();
+    int utcYear = gps.date.year();
+
+    // Convert current UTC time to total minutes since midnight
+    long totalUTCMins = (long)utcHour * 60 + utcMinute;
+    
+    // Add the IST offset
+    long totalISTMins = totalUTCMins + IST_OFFSET_MINUTES;
+
+    // The logic below implements simple day rollover. For production use, 
+    // a full date/time library is recommended for robust month/year rollovers.
+    // 1440 minutes in a day
+    if (totalISTMins >= 1440) { 
+        totalISTMins -= 1440; // Normalize back to minutes within the new day
+        
+        // Simple day increment for display purposes
+        utcDay++; 
+        
+        // Check for month end (Simplified: only for 30/31 days)
+        if (utcDay > 31 || 
+            (utcMonth == 2 && utcDay > (gps.date.year() % 4 == 0 ? 29 : 28)) ||
+            ((utcMonth == 4 || utcMonth == 6 || utcMonth == 9 || utcMonth == 11) && utcDay > 30)) {
+            utcDay = 1;
+            utcMonth++;
+            if (utcMonth > 12) {
+                utcMonth = 1;
+                utcYear++;
+            }
+        }
+    }
+
+    // Calculate IST hour and minute
+    istTime.hour = totalISTMins / 60;
+    istTime.minute = totalISTMins % 60;
+    istTime.second = utcSecond;
+    istTime.day = utcDay;
+    istTime.month = utcMonth;
+    istTime.year = utcYear;
+}
+
 void readGPS() {
     while (GPS_SERIAL.available() > 0) {
         gps.encode(GPS_SERIAL.read());
@@ -760,7 +832,12 @@ void readGPS() {
         telemetryData.gnssLongitude = gps.location.lng();
         telemetryData.gnssAltitude = gps.altitude.meters();
         telemetryData.gnssSatellites = gps.satellites.value();
+
+        // NEW: Calculate and store IST time
+        if (gps.date.isUpdated() && gps.time.isUpdated()) {
+            calculateIST(telemetryData.istTime);
     }
+}
 }
 
 void readIMU() {
@@ -805,6 +882,8 @@ void readBME680() {
         checkIaqSensorStatus();
     }
 }
+
+
 
 void checkIaqSensorStatus(void) {
     if (bme680.bsecStatus != BSEC_OK) {
@@ -986,3 +1065,4 @@ String getNextFileName(String baseName, String extension) {
     
     DEBUG_SERIAL.println("Next available file: " + fileName);
     return fileName;
+}

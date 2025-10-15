@@ -17,6 +17,11 @@ const char* TEAM_ID = "2024ASI-CANSAT-123";
 #define SPI_MISO_PIN 19
 #define SPI_SCK_PIN 18
 #define SD_CS_PIN 5
+#define GPS_RX_PIN 16
+#define  GPS_TX_PIN 17
+#define LORA_SS_PIN 5
+#define  LORA_RST_PIN 14
+#define  LORA_DIO0_PIN 2
 // Actuator & Indicator Pins
 #define STATUS_LED_PIN 2 // Built-in LED on most ESP32 boards
 #define BUZZER_PIN 26
